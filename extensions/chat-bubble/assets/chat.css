@@ -188,6 +188,14 @@
     border-bottom-left-radius: 4px;
   }
 
+  /* Inline image messages (slice 8) */
+  .shop-ai-message-image {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border-radius: 12px;
+  }
+
   .shop-ai-message.assistant a {
     color: #5046e4;
     text-decoration: underline;

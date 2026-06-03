@@ -234,7 +234,7 @@
        */
       send: async function(chatInput, messagesContainer) {
         const userMessage = chatInput.value.trim();
-        const conversationId = sessionStorage.getItem('shopAiConversationId');
+        const conversationId = ShopAIChat.API.getConversationId();
 
         // Add user message to chat
         this.add(userMessage, 'user', messagesContainer);
@@ -271,6 +271,30 @@
         } else {
           messageElement.textContent = text;
         }
+
+        messagesContainer.appendChild(messageElement);
+        ShopAIChat.UI.scrollToBottom();
+
+        return messageElement;
+      },
+
+      /**
+       * Add an image message to the chat (slice 8).
+       * @param {string} url - The image URL
+       * @param {string} sender - Message sender ('user' or 'assistant')
+       * @param {HTMLElement} messagesContainer - The messages container
+       * @returns {HTMLElement} The created message element
+       */
+      addImage: function(url, sender, messagesContainer) {
+        const messageElement = document.createElement('div');
+        messageElement.classList.add('shop-ai-message', sender);
+
+        const image = document.createElement('img');
+        image.classList.add('shop-ai-message-image');
+        image.src = url;
+        image.alt = 'Shared image';
+        image.loading = 'lazy';
+        messageElement.appendChild(image);
 
         messagesContainer.appendChild(messageElement);
         ShopAIChat.UI.scrollToBottom();
@@ -465,6 +489,25 @@
      */
     API: {
       /**
+       * Get (or lazily create) the stable conversation id.
+       *
+       * The id is a `crypto.randomUUID()` persisted in `localStorage` so it
+       * survives tab close and reloads (plan 0002 H6 - it is the deepagents
+       * checkpointer thread anchor). `sessionStorage` was the orphan defect.
+       * @returns {string} The conversation id
+       */
+      getConversationId: function() {
+        let id = localStorage.getItem('shopAiConversationId');
+        if (!id) {
+          id = (window.crypto && typeof crypto.randomUUID === 'function')
+            ? crypto.randomUUID()
+            : 'cid-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+          localStorage.setItem('shopAiConversationId', id);
+        }
+        return id;
+      },
+
+      /**
        * Stream a response from the API
        * @param {string} userMessage - User's message text
        * @param {string} conversationId - Conversation ID for context
@@ -547,7 +590,7 @@
         switch (data.type) {
           case 'id':
             if (data.conversation_id) {
-              sessionStorage.setItem('shopAiConversationId', data.conversation_id);
+              localStorage.setItem('shopAiConversationId', data.conversation_id);
             }
             break;
 
@@ -587,6 +630,14 @@
 
           case 'product_results':
             ShopAIChat.UI.displayProductResults(data.products);
+            break;
+
+          case 'image':
+            // Slice 8 (outbound): assistant-sent image rendered inline.
+            ShopAIChat.UI.removeTypingIndicator();
+            if (data.url) {
+              ShopAIChat.Message.addImage(data.url, 'assistant', messagesContainer);
+            }
             break;
 
           case 'tool_use':
@@ -666,6 +717,9 @@
               for (const contentBlock of messageContents) {
                 if (contentBlock.type === 'text') {
                   ShopAIChat.Message.add(contentBlock.text, message.role, messagesContainer);
+                } else if (contentBlock.type === 'image' && contentBlock.url) {
+                  // Slice 8: re-render prior assistant/customer images.
+                  ShopAIChat.Message.addImage(contentBlock.url, message.role, messagesContainer);
                 }
               }
             } catch (e) {
@@ -690,7 +744,7 @@
           ShopAIChat.Message.add(welcomeMessage, 'assistant', messagesContainer);
 
           // Clear the conversation ID since we couldn't fetch this conversation
-          sessionStorage.removeItem('shopAiConversationId');
+          localStorage.removeItem('shopAiConversationId');
         }
       }
     },
@@ -738,7 +792,7 @@
         }
 
         // Start polling for token availability
-        const conversationId = sessionStorage.getItem('shopAiConversationId');
+        const conversationId = localStorage.getItem('shopAiConversationId');
         if (conversationId) {
           const messagesContainer = document.querySelector('.shop-ai-chat-messages');
 
@@ -911,8 +965,8 @@
 
       this.UI.init(container);
 
-      // Check for existing conversation
-      const conversationId = sessionStorage.getItem('shopAiConversationId');
+      // Check for existing conversation (durable localStorage anchor).
+      const conversationId = localStorage.getItem('shopAiConversationId');
 
       if (conversationId) {
         // Fetch conversation history
