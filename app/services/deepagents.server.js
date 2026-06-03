@@ -88,26 +88,59 @@ export function imageUrlOf(image) {
 }
 
 /**
+ * Coerce inbound image entries to the locked `images[]` contract shape.
+ *
+ * The widget reads a picked file with `FileReader` and sends each as
+ * `{mime_type, data}` where `data` is base64 (ADR 0016, slice 8-inbound). The
+ * server strips any `data:<mime>;base64,` prefix and sniffs the real mime, so
+ * `mime_type` is advisory; we still forward it. Entries without a `data`
+ * payload are dropped (an empty image is nothing to reason over).
+ *
+ * @param {Array<Object>} [images] - Raw image entries
+ * @returns {Array<Object>} `[{mime_type, data}]` entries (possibly empty)
+ */
+export function normalizeImageEntries(images) {
+  if (!Array.isArray(images)) return [];
+  const out = [];
+  for (const image of images) {
+    if (!image || typeof image !== "object") continue;
+    const data = typeof image.data === "string" ? image.data : "";
+    if (!data) continue;
+    out.push({
+      mime_type: typeof image.mime_type === "string" ? image.mime_type : "",
+      data,
+    });
+  }
+  return out;
+}
+
+/**
  * Build the request body for the deepagents sync endpoint.
  *
  * `customer_id` carries the anonymous `localStorage` UUID — it is the
  * checkpointer thread anchor (plan 0002 H6). `shop_domain` is advisory only:
  * the endpoint is config-authoritative and ignores it when `SHOPIFY_SHOP_DOMAIN`
- * is set server-side.
+ * is set server-side. `images[]` carries inbound customer-uploaded photos as
+ * base64 (ADR 0016); it is included only when non-empty so a text-only turn
+ * sends the same body it always did. An image-only turn (no caption) sends an
+ * empty `message` with a non-empty `images[]`.
  *
  * @param {Object} params
  * @param {string} params.message - The user's text
  * @param {string} params.conversationId - The anonymous thread anchor (UUID)
  * @param {string} [params.shopDomain] - Advisory shop domain
+ * @param {Array<Object>} [params.images] - Inbound images `[{mime_type, data}]`
  * @returns {Object} JSON-serializable request body
  */
-export function buildRequestBody({ message, conversationId, shopDomain }) {
+export function buildRequestBody({ message, conversationId, shopDomain, images }) {
   const body = {
     message,
     customer_id: conversationId,
     conversation_id: conversationId,
   };
   if (shopDomain) body.shop_domain = shopDomain;
+  const imageEntries = normalizeImageEntries(images);
+  if (imageEntries.length) body.images = imageEntries;
   return body;
 }
 
@@ -161,6 +194,36 @@ export function buildAssistantBlocks(sync = {}) {
 }
 
 /**
+ * Build the display-cache content blocks for the customer's own turn.
+ *
+ * The widget renders the picked image immediately from a local data URL, but
+ * the deepagents sync response never echoes the customer's upload back, so the
+ * save path must persist it itself or the image vanishes on a history reload
+ * (slice 8-inbound AC). We store each inbound image as a `data:` URL block that
+ * `fetchChatHistory` re-renders with the same `{type:'image', url}` path it uses
+ * for assistant images. The text block is included only when there is a caption,
+ * so an image-only turn persists just its image(s).
+ *
+ * @param {Object} params
+ * @param {string} [params.message] - The user's caption (may be empty)
+ * @param {Array<Object>} [params.images] - Inbound images `[{mime_type, data}]`
+ * @returns {Array<Object>} Content blocks (`{type:'text'|'image', ...}`)
+ */
+export function buildUserBlocks({ message, images } = {}) {
+  const blocks = [];
+  const text = typeof message === "string" ? message.trim() : "";
+  if (text) blocks.push({ type: "text", text });
+  for (const image of normalizeImageEntries(images)) {
+    const data = image.data;
+    const url = data.startsWith("data:")
+      ? data
+      : `data:${image.mime_type || "image/jpeg"};base64,${data}`;
+    blocks.push({ type: "image", url });
+  }
+  return blocks;
+}
+
+/**
  * Creates a deepagents service instance.
  *
  * @param {Object} [options]
@@ -186,14 +249,15 @@ export function createDeepAgentsService(options = {}) {
    * @param {string} params.message - The user's text
    * @param {string} params.conversationId - The anonymous thread anchor (UUID)
    * @param {string} [params.shopDomain] - Advisory shop domain
+   * @param {Array<Object>} [params.images] - Inbound images `[{mime_type, data}]`
    * @returns {Promise<Object>} The normalized `ShopifySyncResponse` envelope
    * @throws {DeepAgentsError} On a non-2xx response
    */
-  const invoke = async ({ message, conversationId, shopDomain }) => {
+  const invoke = async ({ message, conversationId, shopDomain, images }) => {
     const response = await fetchImpl(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(buildRequestBody({ message, conversationId, shopDomain })),
+      body: JSON.stringify(buildRequestBody({ message, conversationId, shopDomain, images })),
     });
 
     if (!response.ok) {
@@ -217,8 +281,10 @@ export default {
   normalizeSyncResponse,
   mapProductCard,
   imageUrlOf,
+  normalizeImageEntries,
   buildRequestBody,
   buildTurnEvents,
   buildAssistantBlocks,
+  buildUserBlocks,
   DeepAgentsError,
 };

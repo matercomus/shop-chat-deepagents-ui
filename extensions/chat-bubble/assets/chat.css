@@ -365,6 +365,78 @@
     cursor: pointer;
   }
 
+  /* Image-attachment control (slice 8-inbound) */
+  .shop-ai-chat-attach {
+    background-color: transparent;
+    color: #606060;
+    border: none;
+    border-radius: 50%;
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex: 0 0 auto;
+    padding: 0;
+  }
+
+  .shop-ai-chat-attach:hover {
+    color: #5046e4;
+    background-color: #f1f1f1;
+  }
+
+  /* Pending-attachment preview strip, above the input row */
+  .shop-ai-chat-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 16px 0;
+  }
+
+  .shop-ai-chat-attachments[hidden] {
+    display: none;
+  }
+
+  .shop-ai-attachment {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid #e9e9e9;
+  }
+
+  .shop-ai-attachment img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .shop-ai-attachment-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border: none;
+    border-radius: 50%;
+    background-color: rgba(0, 0, 0, 0.6);
+    color: white;
+    font-size: 14px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .shop-ai-attachment-remove:hover {
+    background-color: rgba(0, 0, 0, 0.85);
+  }
+
   .shop-ai-typing-indicator {
     display: flex;
     align-items: center;
