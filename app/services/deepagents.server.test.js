@@ -4,6 +4,7 @@ import {
   mapProductCard,
   imageUrlOf,
   normalizeImageEntries,
+  buildRequestHeaders,
   buildRequestBody,
   buildTurnEvents,
   buildAssistantBlocks,
@@ -214,6 +215,86 @@ describe("buildAssistantBlocks", () => {
   });
   it("is empty when there is nothing to show", () => {
     expect(buildAssistantBlocks({ reply_text: "", images: [] })).toEqual([]);
+  });
+});
+
+describe("buildRequestHeaders", () => {
+  it("sends JSON with no auth header in dev (empty token)", () => {
+    expect(buildRequestHeaders("")).toEqual({
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    });
+    expect(buildRequestHeaders(undefined)).not.toHaveProperty("Authorization");
+  });
+  it("attaches a bearer header for the cloud shim when a token is set", () => {
+    expect(buildRequestHeaders("s3cr3t")).toEqual({
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: "Bearer s3cr3t",
+    });
+  });
+});
+
+describe("createDeepAgentsService endpoint/auth selection (issue #8)", () => {
+  it("targets the local main.py endpoint with no auth header by default", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }));
+    const svc = createDeepAgentsService({
+      baseUrl: "http://localhost:8000",
+      brand: "lux3three",
+      authToken: "",
+      fetchImpl,
+    });
+    expect(svc.endpoint).toBe("http://localhost:8000/shopify/agent/lux3three");
+    await svc.invoke({ message: "hi", conversationId: "u" });
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers.Authorization).toBeUndefined();
+  });
+
+  it("targets the cloud shim and attaches the bearer header when a token is configured", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }));
+    const svc = createDeepAgentsService({
+      baseUrl: "https://jyr4f78wzb.execute-api.us-east-1.amazonaws.com",
+      brand: "lux3three",
+      authToken: "shim-token",
+      fetchImpl,
+    });
+    expect(svc.endpoint).toBe(
+      "https://jyr4f78wzb.execute-api.us-east-1.amazonaws.com/shopify/agent/lux3three",
+    );
+    await svc.invoke({ message: "hi", conversationId: "u" });
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers.Authorization).toBe("Bearer shim-token");
+  });
+
+  it("forwards images[] over the cloud endpoint too (slice 8 over the shim)", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }));
+    const svc = createDeepAgentsService({
+      baseUrl: "https://shim.example",
+      brand: "lux3three",
+      authToken: "t",
+      fetchImpl,
+    });
+    await svc.invoke({
+      message: "",
+      conversationId: "u",
+      images: [{ mime_type: "image/jpeg", data: "QUJD" }],
+    });
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers.Authorization).toBe("Bearer t");
+    expect(JSON.parse(init.body).images).toEqual([{ mime_type: "image/jpeg", data: "QUJD" }]);
+  });
+
+  it("surfaces a 504 gateway timeout as a DeepAgentsError carrying status 504", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 504,
+      text: async () => "gateway timeout",
+    }));
+    const svc = createDeepAgentsService({ baseUrl: "https://shim.example", authToken: "t", fetchImpl });
+    await expect(svc.invoke({ message: "hi", conversationId: "u" })).rejects.toMatchObject({
+      name: "DeepAgentsError",
+      status: 504,
+    });
   });
 });
 

@@ -21,6 +21,7 @@ import {
   buildAssistantBlocks,
   buildUserBlocks,
   normalizeImageEntries,
+  DeepAgentsError,
 } from "../services/deepagents.server";
 
 
@@ -162,9 +163,16 @@ async function handleChatSession({
     sync = await deepagents.invoke({ message: userMessage, conversationId, shopDomain, images });
   } catch (error) {
     console.error('DeepAgents invoke failed:', error);
+    // A 504 from the cloud shim is a gateway timeout and is *indeterminate*: the
+    // agent turn may still have committed its checkpoint server-side (ADR 0017).
+    // We never auto-retry (there is no retry here) — instead we ask the customer
+    // to re-send, so a slow turn does not double-advance the thread.
+    const isTimeout = error instanceof DeepAgentsError && error.status === 504;
     sync = {
       ok: false,
-      reply_text: AppConfig.errorMessages.agentUnavailable,
+      reply_text: isTimeout
+        ? AppConfig.errorMessages.agentTimeout
+        : AppConfig.errorMessages.agentUnavailable,
       products: [],
       images: [],
       links: [],
