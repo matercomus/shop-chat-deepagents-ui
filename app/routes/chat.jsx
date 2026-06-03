@@ -1,17 +1,29 @@
 /**
  * Chat API Route
- * Handles chat interactions with Claude API and tools
+ *
+ * Thin SSE adapter in front of the deepagents synchronous Shopify endpoint
+ * (ADR 0015 / plan 0002 §1). One customer message -> one sync call to
+ * `POST /shopify/agent/{brand}` -> re-emit the existing SSE events so the
+ * storefront widget renders unchanged.
+ *
+ * The in-browser Anthropic + MCP orchestration loop (claude.server.js /
+ * tool.server.js / mcp-client.js) is gone: catalog search, tool calls and the
+ * conversation thread now live in the deepagents runtime. Prisma keeps only a
+ * thin display cache (text + image blocks) so widget history survives reloads;
+ * the deepagents checkpointer is the canonical thread.
  */
-import MCPClient from "../mcp-client";
-import { saveMessage, getConversationHistory, storeCustomerAccountUrls, getCustomerAccountUrls as getCustomerAccountUrlsFromDb } from "../db.server";
+import { saveMessage, getConversationHistory } from "../db.server";
 import AppConfig from "../services/config.server";
 import { createSseStream } from "../services/streaming.server";
-import { createClaudeService } from "../services/claude.server";
-import { createToolService } from "../services/tool.server";
+import {
+  createDeepAgentsService,
+  buildTurnEvents,
+  buildAssistantBlocks,
+} from "../services/deepagents.server";
 
 
 /**
- * Rract Router loader function for handling GET requests
+ * React Router loader function for handling GET requests
  */
 export async function loader({ request }) {
   // Handle OPTIONS requests (CORS preflight)
@@ -76,17 +88,18 @@ async function handleChatRequest(request) {
       );
     }
 
-    // Generate or use existing conversation ID
-    const conversationId = body.conversation_id || Date.now().toString();
-    const promptType = body.prompt_type || AppConfig.api.defaultPromptType;
+    // The widget generates a stable localStorage UUID and sends it as the
+    // anonymous thread anchor (plan 0002 H6); fall back to a fresh UUID only if
+    // a client somehow omits it.
+    const conversationId = body.conversation_id || crypto.randomUUID();
+    const shopDomain = resolveShopDomain(request);
 
     // Create a stream for the response
     const responseStream = createSseStream(async (stream) => {
       await handleChatSession({
-        request,
         userMessage,
         conversationId,
-        promptType,
+        shopDomain,
         stream
       });
     });
@@ -104,225 +117,88 @@ async function handleChatRequest(request) {
 }
 
 /**
- * Handle a complete chat session
+ * Handle a complete chat session: one sync turn through deepagents, re-emitted
+ * as the widget's SSE event vocabulary.
+ *
  * @param {Object} params - Session parameters
- * @param {Request} params.request - The request object
  * @param {string} params.userMessage - The user's message
- * @param {string} params.conversationId - The conversation ID
- * @param {string} params.promptType - The prompt type
+ * @param {string} params.conversationId - The conversation ID (thread anchor)
+ * @param {string} params.shopDomain - The (advisory) shop domain
  * @param {Object} params.stream - Stream manager for sending responses
  */
 async function handleChatSession({
-  request,
   userMessage,
   conversationId,
-  promptType,
+  shopDomain,
   stream
 }) {
-  // Initialize services
-  const claudeService = createClaudeService();
-  const toolService = createToolService();
+  const deepagents = createDeepAgentsService();
 
-  // Initialize MCP client
-  const shopId = request.headers.get("X-Shopify-Shop-Id");
-  const shopDomain = request.headers.get("Origin");
-  const { mcpApiUrl } = await getCustomerAccountUrls(shopDomain, conversationId);
+  // Anchor the client on the conversation id up front, even if the turn is slow.
+  stream.sendMessage({ type: 'id', conversation_id: conversationId });
 
-  const mcpClient = new MCPClient(
-    shopDomain,
-    conversationId,
-    shopId,
-    mcpApiUrl,
-  );
+  // Thin display cache: persist the user message (text block) for history reload.
+  saveMessage(conversationId, 'user', JSON.stringify([{ type: 'text', text: userMessage }]))
+    .catch((error) => console.error('Error saving user message:', error));
 
+  // One synchronous turn. Any failure is mapped to a deliverable apology so the
+  // contract's "deliver reply_text even when ok is false" holds.
+  let sync;
   try {
-    // Send conversation ID to client
-    stream.sendMessage({ type: 'id', conversation_id: conversationId });
-
-    // Connect to MCP servers and get available tools
-    let storefrontMcpTools = [], customerMcpTools = [];
-
-    try {
-      storefrontMcpTools = await mcpClient.connectToStorefrontServer();
-      customerMcpTools = await mcpClient.connectToCustomerServer();
-
-      console.log(`Connected to MCP with ${storefrontMcpTools.length} tools`);
-      console.log(`Connected to customer MCP with ${customerMcpTools.length} tools`);
-    } catch (error) {
-      console.warn('Failed to connect to MCP servers, continuing without tools:', error.message);
-    }
-
-    // Prepare conversation state
-    let conversationHistory = [];
-    let productsToDisplay = [];
-
-    // Save user message to the database
-    await saveMessage(conversationId, 'user', userMessage);
-
-    // Fetch all messages from the database for this conversation
-    const dbMessages = await getConversationHistory(conversationId);
-
-    // Format messages for Claude API
-    conversationHistory = dbMessages.map(dbMessage => {
-      let content;
-      try {
-        content = JSON.parse(dbMessage.content);
-      } catch (e) {
-        content = dbMessage.content;
-      }
-      return {
-        role: dbMessage.role,
-        content
-      };
-    });
-
-    // Execute the conversation stream
-    let finalMessage = { role: 'user', content: userMessage };
-
-    while (finalMessage.stop_reason !== "end_turn") {
-      finalMessage = await claudeService.streamConversation(
-        {
-          messages: conversationHistory,
-          promptType,
-          tools: mcpClient.tools
-        },
-        {
-          // Handle text chunks
-          onText: (textDelta) => {
-            stream.sendMessage({
-              type: 'chunk',
-              chunk: textDelta
-            });
-          },
-
-          // Handle complete messages
-          onMessage: (message) => {
-            conversationHistory.push({
-              role: message.role,
-              content: message.content
-            });
-
-            saveMessage(conversationId, message.role, JSON.stringify(message.content))
-              .catch((error) => {
-                console.error("Error saving message to database:", error);
-              });
-
-            // Send a completion message
-            stream.sendMessage({ type: 'message_complete' });
-          },
-
-          // Handle tool use requests
-          onToolUse: async (content) => {
-            const toolName = content.name;
-            const toolArgs = content.input;
-            const toolUseId = content.id;
-
-            const toolUseMessage = `Calling tool: ${toolName} with arguments: ${JSON.stringify(toolArgs)}`;
-
-            stream.sendMessage({
-              type: 'tool_use',
-              tool_use_message: toolUseMessage
-            });
-
-            // Call the tool
-            const toolUseResponse = await mcpClient.callTool(toolName, toolArgs);
-
-            // Handle tool response based on success/error
-            if (toolUseResponse.error) {
-              await toolService.handleToolError(
-                toolUseResponse,
-                toolName,
-                toolUseId,
-                conversationHistory,
-                stream.sendMessage,
-                conversationId
-              );
-            } else {
-              await toolService.handleToolSuccess(
-                toolUseResponse,
-                toolName,
-                toolUseId,
-                conversationHistory,
-                productsToDisplay,
-                conversationId
-              );
-            }
-
-            // Signal new message to client
-            stream.sendMessage({ type: 'new_message' });
-          },
-
-          // Handle content block completion
-          onContentBlock: (contentBlock) => {
-            if (contentBlock.type === 'text') {
-              stream.sendMessage({
-                type: 'content_block_complete',
-                content_block: contentBlock
-              });
-            }
-          }
-        }
-      );
-    }
-
-    // Signal end of turn
-    stream.sendMessage({ type: 'end_turn' });
-
-    // Send product results if available
-    if (productsToDisplay.length > 0) {
-      stream.sendMessage({
-        type: 'product_results',
-        products: productsToDisplay
-      });
-    }
+    sync = await deepagents.invoke({ message: userMessage, conversationId, shopDomain });
   } catch (error) {
-    // The streaming handler takes care of error handling
-    throw error;
+    console.error('DeepAgents invoke failed:', error);
+    sync = {
+      ok: false,
+      reply_text: AppConfig.errorMessages.agentUnavailable,
+      products: [],
+      images: [],
+      links: [],
+      thread_id: '',
+      auth_required: null,
+      runtime_session_id: ''
+    };
+  }
+
+  // Re-emit the turn as SSE events (chunk -> message_complete -> image* ->
+  // end_turn -> product_results). reply_text is delivered regardless of `ok`.
+  for (const event of buildTurnEvents(sync)) {
+    stream.sendMessage(event);
+  }
+
+  // Persist the assistant reply (text + images) to the display cache.
+  const assistantBlocks = buildAssistantBlocks(sync);
+  if (assistantBlocks.length > 0) {
+    saveMessage(conversationId, 'assistant', JSON.stringify(assistantBlocks))
+      .catch((error) => console.error('Error saving assistant message:', error));
   }
 }
 
 /**
- * Get the customer MCP API URL for a shop
- * @param {string} shopDomain - The shop domain
- * @param {string} conversationId - The conversation ID
- * @returns {string} The customer MCP API URL
+ * Resolve the shop domain for the turn.
+ *
+ * The deepagents endpoint is config-authoritative on `shop_domain` (it ignores
+ * a request value when `SHOPIFY_SHOP_DOMAIN` is set server-side), so this is
+ * advisory. Prefer a server-side env var; the browser `Origin` is an untrusted
+ * dev-only fallback (plan 0002 §1 auth boundary) and is never the security
+ * source of truth.
+ *
+ * @param {Request} request - The request object
+ * @returns {string} The shop domain (empty string if unknown)
  */
-async function getCustomerAccountUrls(shopDomain, conversationId) {
-  try {
-    // Check if the customer account URL exists in the DB
-    const existingUrls = await getCustomerAccountUrlsFromDb(conversationId);
+function resolveShopDomain(request) {
+  const configuredDomain = AppConfig.deepagents.shopDomain;
+  if (configuredDomain) return configuredDomain;
 
-    // If URL exists, return early with the MCP API URL
-    if (existingUrls) return existingUrls;
-
-    // If not, query for it from the Shopify API
-    const { hostname } = new URL(shopDomain);
-
-    const urls = await Promise.all([
-      fetch(`https://${hostname}/.well-known/customer-account-api`).then(res => res.json()),
-      fetch(`https://${hostname}/.well-known/openid-configuration`).then(res => res.json()),
-    ]).then(async ([mcpResponse, openidResponse]) => {
-      const response = {
-        mcpApiUrl: mcpResponse.mcp_api,
-        authorizationUrl: openidResponse.authorization_endpoint,
-        tokenUrl: openidResponse.token_endpoint,
-      };
-
-      await storeCustomerAccountUrls({
-        conversationId,
-        mcpApiUrl: mcpResponse.mcp_api,
-        authorizationUrl: openidResponse.authorization_endpoint,
-        tokenUrl: openidResponse.token_endpoint,
-      });
-
-      return response;
-    });
-
-    return urls;
-  } catch (error) {
-    console.error("Error getting customer MCP API URL:", error);
-    return null;
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    try {
+      return new URL(origin).hostname;
+    } catch {
+      // not a parseable URL; fall through
+    }
   }
+  return "";
 }
 
 /**
