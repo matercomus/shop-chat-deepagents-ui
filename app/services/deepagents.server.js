@@ -88,6 +88,24 @@ export function imageUrlOf(image) {
 }
 
 /**
+ * Build the HTTP headers for a sync request.
+ *
+ * Always JSON. When an auth token is configured (the cloud shim path, issue #8
+ * / ADR 0017) it is attached as `Authorization: Bearer <token>`; in dev the
+ * token is empty and no auth header is sent (local `main.py` has no auth). The
+ * token only ever lives in this server-side module — it must never reach the
+ * client bundle.
+ *
+ * @param {string} [authToken] - The shared bearer secret (empty in dev)
+ * @returns {Object} Request headers
+ */
+export function buildRequestHeaders(authToken) {
+  const headers = { "Content-Type": "application/json", Accept: "application/json" };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  return headers;
+}
+
+/**
  * Coerce inbound image entries to the locked `images[]` contract shape.
  *
  * The widget reads a picked file with `FileReader` and sends each as
@@ -226,19 +244,28 @@ export function buildUserBlocks({ message, images } = {}) {
 /**
  * Creates a deepagents service instance.
  *
+ * The target is environment-switched (issue #8): `baseUrl` resolves to the local
+ * `main.py` endpoint in dev and the cloud shim in prod/preview, and `authToken`
+ * is attached as a bearer header only on the cloud path. Both speak the same
+ * wire contract, so the rest of the turn is identical.
+ *
  * @param {Object} [options]
  * @param {string} [options.baseUrl] - deepagents base URL
  * @param {string} [options.brand] - Shopify route brand
+ * @param {string} [options.authToken] - Cloud shim bearer secret (empty in dev)
  * @param {Function} [options.fetchImpl] - fetch override (for tests)
  * @returns {Object} Service with an `invoke` method and the resolved endpoint
  */
 export function createDeepAgentsService(options = {}) {
   const baseUrl = (
     options.baseUrl ||
+    process.env.SHOPIFY_AGENT_SHIM_URL ||
     process.env.DEEPAGENTS_URL ||
     AppConfig.deepagents.url
   ).replace(/\/+$/, "");
   const brand = options.brand || process.env.DEEPAGENTS_BRAND || AppConfig.deepagents.brand;
+  const authToken =
+    options.authToken ?? process.env.SHOPIFY_AGENT_SHIM_TOKEN ?? AppConfig.deepagents.authToken;
   const fetchImpl = options.fetchImpl || fetch;
   const endpoint = `${baseUrl}/shopify/agent/${encodeURIComponent(brand)}`;
 
@@ -256,7 +283,7 @@ export function createDeepAgentsService(options = {}) {
   const invoke = async ({ message, conversationId, shopDomain, images }) => {
     const response = await fetchImpl(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: buildRequestHeaders(authToken),
       body: JSON.stringify(buildRequestBody({ message, conversationId, shopDomain, images })),
     });
 
@@ -282,6 +309,7 @@ export default {
   mapProductCard,
   imageUrlOf,
   normalizeImageEntries,
+  buildRequestHeaders,
   buildRequestBody,
   buildTurnEvents,
   buildAssistantBlocks,
