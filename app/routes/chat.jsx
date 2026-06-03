@@ -19,6 +19,8 @@ import {
   createDeepAgentsService,
   buildTurnEvents,
   buildAssistantBlocks,
+  buildUserBlocks,
+  normalizeImageEntries,
 } from "../services/deepagents.server";
 
 
@@ -79,9 +81,12 @@ async function handleChatRequest(request) {
     // Get message data from request body
     const body = await request.json();
     const userMessage = body.message;
+    // Inbound customer-uploaded images as base64 (ADR 0016 / slice 8-inbound).
+    const images = normalizeImageEntries(body.images);
 
-    // Validate required message
-    if (!userMessage) {
+    // A turn must carry something. An image-only turn (a photo with no caption)
+    // is valid: empty `message` + non-empty `images[]` (ADR 0016).
+    if (!userMessage && images.length === 0) {
       return new Response(
         JSON.stringify({ error: AppConfig.errorMessages.missingMessage }),
         { status: 400, headers: getSseHeaders(request) }
@@ -98,6 +103,7 @@ async function handleChatRequest(request) {
     const responseStream = createSseStream(async (stream) => {
       await handleChatSession({
         userMessage,
+        images,
         conversationId,
         shopDomain,
         stream
@@ -122,12 +128,14 @@ async function handleChatRequest(request) {
  *
  * @param {Object} params - Session parameters
  * @param {string} params.userMessage - The user's message
+ * @param {Array<Object>} params.images - Inbound images `[{mime_type, data}]`
  * @param {string} params.conversationId - The conversation ID (thread anchor)
  * @param {string} params.shopDomain - The (advisory) shop domain
  * @param {Object} params.stream - Stream manager for sending responses
  */
 async function handleChatSession({
   userMessage,
+  images,
   conversationId,
   shopDomain,
   stream
@@ -137,15 +145,21 @@ async function handleChatSession({
   // Anchor the client on the conversation id up front, even if the turn is slow.
   stream.sendMessage({ type: 'id', conversation_id: conversationId });
 
-  // Thin display cache: persist the user message (text block) for history reload.
-  saveMessage(conversationId, 'user', JSON.stringify([{ type: 'text', text: userMessage }]))
-    .catch((error) => console.error('Error saving user message:', error));
+  // Thin display cache: persist the user turn (text + any uploaded image blocks)
+  // for history reload. The customer's image is stored as a data: URL block —
+  // the sync response never echoes the upload back, so without this it vanishes
+  // on refresh (slice 8-inbound AC).
+  const userBlocks = buildUserBlocks({ message: userMessage, images });
+  if (userBlocks.length > 0) {
+    saveMessage(conversationId, 'user', JSON.stringify(userBlocks))
+      .catch((error) => console.error('Error saving user message:', error));
+  }
 
   // One synchronous turn. Any failure is mapped to a deliverable apology so the
   // contract's "deliver reply_text even when ok is false" holds.
   let sync;
   try {
-    sync = await deepagents.invoke({ message: userMessage, conversationId, shopDomain });
+    sync = await deepagents.invoke({ message: userMessage, conversationId, shopDomain, images });
   } catch (error) {
     console.error('DeepAgents invoke failed:', error);
     sync = {

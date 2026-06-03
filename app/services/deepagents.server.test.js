@@ -3,9 +3,11 @@ import {
   normalizeSyncResponse,
   mapProductCard,
   imageUrlOf,
+  normalizeImageEntries,
   buildRequestBody,
   buildTurnEvents,
   buildAssistantBlocks,
+  buildUserBlocks,
   createDeepAgentsService,
   DeepAgentsError,
 } from "./deepagents.server.js";
@@ -94,6 +96,80 @@ describe("buildRequestBody", () => {
     const body = buildRequestBody({ message: "hi", conversationId: "u", shopDomain: "shop.example" });
     expect(body.shop_domain).toBe("shop.example");
   });
+  it("omits images[] entirely for a text-only turn", () => {
+    const body = buildRequestBody({ message: "hi", conversationId: "u" });
+    expect("images" in body).toBe(false);
+    const body2 = buildRequestBody({ message: "hi", conversationId: "u", images: [] });
+    expect("images" in body2).toBe(false);
+  });
+  it("carries images[] in the locked {mime_type, data} shape when present", () => {
+    const body = buildRequestBody({
+      message: "do you have this in black?",
+      conversationId: "u",
+      images: [{ mime_type: "image/jpeg", data: "QUJD" }],
+    });
+    expect(body.images).toEqual([{ mime_type: "image/jpeg", data: "QUJD" }]);
+  });
+  it("supports an image-only turn (empty message + non-empty images[])", () => {
+    const body = buildRequestBody({
+      message: "",
+      conversationId: "u",
+      images: [{ mime_type: "image/png", data: "QUJD" }],
+    });
+    expect(body.message).toBe("");
+    expect(body.images).toEqual([{ mime_type: "image/png", data: "QUJD" }]);
+  });
+});
+
+describe("normalizeImageEntries", () => {
+  it("returns [] for non-array / empty input", () => {
+    expect(normalizeImageEntries()).toEqual([]);
+    expect(normalizeImageEntries(null)).toEqual([]);
+    expect(normalizeImageEntries("nope")).toEqual([]);
+    expect(normalizeImageEntries([])).toEqual([]);
+  });
+  it("drops entries with no base64 data and defaults a missing mime_type", () => {
+    const out = normalizeImageEntries([
+      { mime_type: "image/jpeg", data: "QUJD" },
+      { mime_type: "image/png" }, // no data -> dropped
+      { data: "REVG" }, // no mime -> defaulted to ""
+      "not-an-object",
+    ]);
+    expect(out).toEqual([
+      { mime_type: "image/jpeg", data: "QUJD" },
+      { mime_type: "", data: "REVG" },
+    ]);
+  });
+});
+
+describe("buildUserBlocks", () => {
+  it("builds a text block plus a data: URL image block", () => {
+    const blocks = buildUserBlocks({
+      message: "do you have this in black?",
+      images: [{ mime_type: "image/jpeg", data: "QUJD" }],
+    });
+    expect(blocks).toEqual([
+      { type: "text", text: "do you have this in black?" },
+      { type: "image", url: "data:image/jpeg;base64,QUJD" },
+    ]);
+  });
+  it("omits the text block for an image-only turn", () => {
+    const blocks = buildUserBlocks({
+      message: "",
+      images: [{ mime_type: "image/png", data: "QUJD" }],
+    });
+    expect(blocks).toEqual([{ type: "image", url: "data:image/png;base64,QUJD" }]);
+  });
+  it("passes through a data: URL already carrying its prefix", () => {
+    const blocks = buildUserBlocks({
+      images: [{ mime_type: "image/jpeg", data: "data:image/webp;base64,QUJD" }],
+    });
+    expect(blocks).toEqual([{ type: "image", url: "data:image/webp;base64,QUJD" }]);
+  });
+  it("is empty when there is nothing to show", () => {
+    expect(buildUserBlocks({})).toEqual([]);
+    expect(buildUserBlocks({ message: "   ", images: [] })).toEqual([]);
+  });
 });
 
 describe("buildTurnEvents", () => {
@@ -167,6 +243,18 @@ describe("createDeepAgentsService.invoke", () => {
       conversation_id: "u",
       shop_domain: "s.example",
     });
+  });
+
+  it("forwards images[] in the POST body when present", async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }));
+    const svc = createDeepAgentsService({ baseUrl: "http://x", brand: "b", fetchImpl });
+    await svc.invoke({
+      message: "",
+      conversationId: "u",
+      images: [{ mime_type: "image/jpeg", data: "QUJD" }],
+    });
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(JSON.parse(init.body).images).toEqual([{ mime_type: "image/jpeg", data: "QUJD" }]);
   });
 
   it("throws DeepAgentsError carrying the status on a non-2xx response", async () => {

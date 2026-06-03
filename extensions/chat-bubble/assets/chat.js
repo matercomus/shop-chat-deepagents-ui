@@ -31,8 +31,11 @@
           chatBubble: container.querySelector('.shop-ai-chat-bubble'),
           chatWindow: container.querySelector('.shop-ai-chat-window'),
           closeButton: container.querySelector('.shop-ai-chat-close'),
-          chatInput: container.querySelector('.shop-ai-chat-input input'),
+          chatInput: container.querySelector('.shop-ai-chat-input input[type="text"]'),
           sendButton: container.querySelector('.shop-ai-chat-send'),
+          attachButton: container.querySelector('.shop-ai-chat-attach'),
+          fileInput: container.querySelector('.shop-ai-chat-file'),
+          attachmentsContainer: container.querySelector('.shop-ai-chat-attachments'),
           messagesContainer: container.querySelector('.shop-ai-chat-messages')
         };
 
@@ -52,7 +55,12 @@
        * Set up all event listeners for UI interactions
        */
       setupEventListeners: function() {
-        const { chatBubble, closeButton, chatInput, sendButton, messagesContainer } = this.elements;
+        const { chatBubble, closeButton, chatInput, sendButton, attachButton, fileInput, messagesContainer } = this.elements;
+
+        // A turn is sendable when there is text OR at least one pending image
+        // attachment (an image-only turn is valid — ADR 0016).
+        const canSend = () =>
+          chatInput.value.trim() !== '' || ShopAIChat.Message.hasPendingImages();
 
         // Toggle chat window visibility
         chatBubble.addEventListener('click', () => this.toggleChatWindow());
@@ -62,7 +70,7 @@
 
         // Send message when pressing Enter in input
         chatInput.addEventListener('keypress', (e) => {
-          if (e.key === 'Enter' && chatInput.value.trim() !== '') {
+          if (e.key === 'Enter' && canSend()) {
             ShopAIChat.Message.send(chatInput, messagesContainer);
 
             // On mobile, handle keyboard
@@ -75,7 +83,7 @@
 
         // Send message when clicking send button
         sendButton.addEventListener('click', () => {
-          if (chatInput.value.trim() !== '') {
+          if (canSend()) {
             ShopAIChat.Message.send(chatInput, messagesContainer);
 
             // On mobile, focus input after sending
@@ -84,6 +92,19 @@
             }
           }
         });
+
+        // Open the OS file picker when the attach button is clicked.
+        if (attachButton && fileInput) {
+          attachButton.addEventListener('click', () => fileInput.click());
+
+          // Read the picked files, validate count/size client-side, and queue
+          // them as pending attachments (rendered as removable thumbnails).
+          fileInput.addEventListener('change', () => {
+            ShopAIChat.Message.addPendingImages(fileInput.files);
+            // Reset so picking the same file again still fires `change`.
+            fileInput.value = '';
+          });
+        }
 
         // Handle window resize to adjust scrolling
         window.addEventListener('resize', () => this.scrollToBottom());
@@ -228,25 +249,147 @@
      */
     Message: {
       /**
-       * Send a message to the API
+       * Client-side caps for inbound image uploads (ADR 0016). The server
+       * re-enforces these (4 images / 5MB each) and drops anything over; capping
+       * here is for UX so a customer is not silently truncated.
+       */
+      MAX_IMAGES: 4,
+      MAX_IMAGE_BYTES: 5 * 1024 * 1024,
+
+      // Pending attachments staged before send: {dataUrl, mimeType, base64}.
+      pendingImages: [],
+
+      /**
+       * @returns {boolean} Whether there is at least one staged image attachment
+       */
+      hasPendingImages: function() {
+        return this.pendingImages.length > 0;
+      },
+
+      /**
+       * Stage picked files as pending image attachments after client-side
+       * validation (image type, per-file size cap, total count cap). Reading is
+       * async (`FileReader`), so the preview re-renders as each file resolves.
+       * @param {FileList|File[]} files - Files chosen from the picker
+       */
+      addPendingImages: function(files) {
+        const list = files ? Array.from(files) : [];
+        for (const file of list) {
+          if (this.pendingImages.length >= this.MAX_IMAGES) {
+            console.warn(`Image upload limit reached (${this.MAX_IMAGES}); extra files ignored.`);
+            break;
+          }
+          if (!file.type || !file.type.startsWith('image/')) {
+            console.warn('Skipping non-image attachment:', file.name);
+            continue;
+          }
+          if (file.size > this.MAX_IMAGE_BYTES) {
+            console.warn(`Skipping oversized image (>5MB): ${file.name}`);
+            continue;
+          }
+
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+            const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : '';
+            if (!base64) return;
+            this.pendingImages.push({ dataUrl, mimeType: file.type, base64 });
+            this.renderPendingImages();
+          };
+          reader.onerror = () => console.error('Failed to read image file:', file.name);
+          reader.readAsDataURL(file);
+        }
+      },
+
+      /**
+       * Remove one staged attachment by index and re-render the preview strip.
+       * @param {number} index - Index into `pendingImages`
+       */
+      removePendingImage: function(index) {
+        this.pendingImages.splice(index, 1);
+        this.renderPendingImages();
+      },
+
+      /**
+       * Clear all staged attachments and hide the preview strip.
+       */
+      clearPendingImages: function() {
+        this.pendingImages = [];
+        this.renderPendingImages();
+      },
+
+      /**
+       * Render the pending-attachment thumbnails (each with a remove control)
+       * into the preview strip below the messages, hiding it when empty.
+       */
+      renderPendingImages: function() {
+        const container = ShopAIChat.UI.elements.attachmentsContainer;
+        if (!container) return;
+
+        container.innerHTML = '';
+        if (this.pendingImages.length === 0) {
+          container.hidden = true;
+          return;
+        }
+        container.hidden = false;
+
+        this.pendingImages.forEach((image, index) => {
+          const thumb = document.createElement('div');
+          thumb.classList.add('shop-ai-attachment');
+
+          const img = document.createElement('img');
+          img.src = image.dataUrl;
+          img.alt = 'Attachment preview';
+          thumb.appendChild(img);
+
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.classList.add('shop-ai-attachment-remove');
+          remove.setAttribute('aria-label', 'Remove attachment');
+          remove.textContent = '×';
+          remove.addEventListener('click', () => this.removePendingImage(index));
+          thumb.appendChild(remove);
+
+          container.appendChild(thumb);
+        });
+      },
+
+      /**
+       * Send a message (and/or staged image attachments) to the API.
        * @param {HTMLInputElement} chatInput - The input element
        * @param {HTMLElement} messagesContainer - The messages container
        */
       send: async function(chatInput, messagesContainer) {
         const userMessage = chatInput.value.trim();
+        // Snapshot the staged attachments and clear the staging area so a slow
+        // turn cannot double-send them.
+        const attachments = this.pendingImages.slice();
+        if (!userMessage && attachments.length === 0) return;
+
         const conversationId = ShopAIChat.API.getConversationId();
 
-        // Add user message to chat
-        this.add(userMessage, 'user', messagesContainer);
+        // Render the customer turn: caption (if any) then each uploaded image,
+        // reusing the slice 8-outbound `addImage` path with sender='user'.
+        if (userMessage) this.add(userMessage, 'user', messagesContainer);
+        for (const image of attachments) {
+          this.addImage(image.dataUrl, 'user', messagesContainer);
+        }
 
-        // Clear input
+        // Clear input + staged attachments
         chatInput.value = '';
+        this.clearPendingImages();
+
+        // Forward images to the endpoint as the locked images[] contract shape.
+        const images = attachments.map((image) => ({
+          mime_type: image.mimeType,
+          data: image.base64,
+        }));
 
         // Show typing indicator
         ShopAIChat.UI.showTypingIndicator();
 
         try {
-          ShopAIChat.API.streamResponse(userMessage, conversationId, messagesContainer);
+          ShopAIChat.API.streamResponse(userMessage, conversationId, messagesContainer, images);
         } catch (error) {
           console.error('Error communicating with Claude API:', error);
           ShopAIChat.UI.removeTypingIndicator();
@@ -512,17 +655,24 @@
        * @param {string} userMessage - User's message text
        * @param {string} conversationId - Conversation ID for context
        * @param {HTMLElement} messagesContainer - The messages container
+       * @param {Array<Object>} [images] - Inbound images `[{mime_type, data}]`
        */
-      streamResponse: async function(userMessage, conversationId, messagesContainer) {
+      streamResponse: async function(userMessage, conversationId, messagesContainer, images) {
         let currentMessageElement = null;
 
         try {
           const promptType = window.shopChatConfig?.promptType || "standardAssistant";
-          const requestBody = JSON.stringify({
+          const payload = {
             message: userMessage,
             conversation_id: conversationId,
             prompt_type: promptType
-          });
+          };
+          // Only attach images[] when present so a text-only turn sends the
+          // same body it always did (ADR 0016).
+          if (Array.isArray(images) && images.length > 0) {
+            payload.images = images;
+          }
+          const requestBody = JSON.stringify(payload);
 
           const streamUrl = 'https://localhost:3458/chat';
           const shopId = window.shopId;
@@ -937,7 +1087,7 @@
         // Add click handler for the button
         button.addEventListener('click', function() {
           // Send message to add this product to cart
-          const input = document.querySelector('.shop-ai-chat-input input');
+          const input = document.querySelector('.shop-ai-chat-input input[type="text"]');
           if (input) {
             input.value = `Add ${product.title} to my cart`;
             // Trigger a click on the send button
