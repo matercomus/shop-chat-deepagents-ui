@@ -8,6 +8,18 @@
   'use strict';
 
   /**
+   * Resolve the deployed backend's base URL.
+   *
+   * Injected per-deployment via the theme app-extension block setting
+   * (window.shopChatConfig.apiBaseUrl). Falls back to the local dev tunnel
+   * when unset so local dev needs no code edit to switch environments.
+   * @returns {string} HTTPS origin of the app, no trailing slash
+   */
+  function getApiBaseUrl() {
+    return window.shopChatConfig?.apiBaseUrl || 'https://localhost:3458';
+  }
+
+  /**
    * Application namespace to prevent global scope pollution
    */
   const ShopAIChat = {
@@ -674,7 +686,7 @@
           }
           const requestBody = JSON.stringify(payload);
 
-          const streamUrl = 'https://localhost:3458/chat';
+          const streamUrl = getApiBaseUrl() + '/chat';
           const shopId = window.shopId;
 
           const response = await fetch(streamUrl, {
@@ -831,7 +843,7 @@
           messagesContainer.appendChild(loadingMessage);
 
           // Fetch history from the server
-          const historyUrl = `https://localhost:3458/chat?history=true&conversation_id=${encodeURIComponent(conversationId)}`;
+          const historyUrl = `${getApiBaseUrl()}/chat?history=true&conversation_id=${encodeURIComponent(conversationId)}`;
           console.log('Fetching history from:', historyUrl);
 
           const response = await fetch(historyUrl, {
@@ -983,7 +995,7 @@
           attemptCount++;
 
           try {
-            const tokenUrl = 'https://localhost:3458/auth/token-status?conversation_id=' +
+            const tokenUrl = getApiBaseUrl() + '/auth/token-status?conversation_id=' +
               encodeURIComponent(conversationId);
             const response = await fetch(tokenUrl);
 
