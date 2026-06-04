@@ -49,7 +49,8 @@
 <script>
   window.shopChatConfig = {
     promptType: {{ block.settings.system_prompt | json }},
-    welcomeMessage: {{ block.settings.welcome_message | json }}
+    welcomeMessage: {{ block.settings.welcome_message | json }},
+    apiBaseUrl: {{ block.settings.backend_url | json }}
   };
   window.shopId = {{ shop.id }};
 </script>
@@ -70,6 +71,12 @@
       "id": "welcome_message",
       "label": "Welcome Message",
       "default": "👋 Hi there! How can I help you today?"
+    },
+    {
+      "type": "text",
+      "id": "backend_url",
+      "label": "Backend URL",
+      "info": "HTTPS origin of the deployed chat app (the application_url in shopify.app.toml), no trailing slash. Leave blank for local dev (falls back to https://localhost:3458)."
     },
     {
       "type": "select",
